@@ -1,0 +1,21 @@
+{
+  "name": "autopoietic-builder",
+  "description": "Scaffolds self-modifying, knowledge-caching, mission-bounded skills and agents that learn new capabilities on demand and persist what they learn to disk.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Benjamin Small"
+  },
+  "homepage": "https://github.com/benjamin-small/agentic-harnesses",
+  "repository": "https://github.com/benjamin-small/agentic-harnesses",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "agents",
+    "scaffolding",
+    "self-modifying",
+    "autopoietic",
+    "knowledge-cache",
+    "progressive-disclosure",
+    "agentskills.io"
+  ]
+}

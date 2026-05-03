@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+#
+# scaffold-autopoietic-skill — portable scaffolder for autopoietic skills.
+#
+# Reads the template fenced blocks from
+# <plugin-root>/skills/autopoietic-builder/references/architecture.md
+# (single source of truth for both this script and the in-CC scaffolder),
+# substitutes a fixed allowlist of placeholders, and writes a complete
+# agentskills.io-compliant skill bundle to the target directory.
+#
+# Usage:
+#   scaffold-autopoietic-skill <name> --mission "<domain>" [--target <dir>]
+#                                     [--license <name>] [--allowed-tools "..."]
+#                                     [--in-scope-file <path>] [--out-of-scope-file <path>]
+#
+# If --in-scope-file / --out-of-scope-file are omitted, you'll be prompted
+# (or, in non-interactive mode, sensible defaults are used).
+#
+# Exits non-zero on any validation failure.
+
+set -euo pipefail
+
+# ---------- helpers ---------------------------------------------------------
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+# Compute sha256 portably (macOS shasum, Linux sha256sum).
+sha256_of_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "no sha256 tool found (need sha256sum or shasum)"
+  fi
+}
+
+# envsubst with allowlist; falls back to manual substitution if envsubst missing.
+render_with_allowlist() {
+  # $1 = input file, prints to stdout
+  local in="$1"
+  if command -v envsubst >/dev/null 2>&1; then
+    envsubst '${SKILL_NAME} ${SKILL_TITLE} ${SKILL_DESCRIPTION} ${MISSION_DOMAIN} ${MISSION_IN_SCOPE} ${MISSION_OUT_OF_SCOPE} ${LICENSE} ${COMPATIBILITY} ${ALLOWED_TOOLS} ${AUTOPOIETIC_VERSION} ${MISSION_HASH} ${CREATED_AT} ${CREATED_AT_DATE}' < "$in"
+  else
+    # Pure-sed fallback. Allowlist is hard-coded.
+    sed \
+      -e "s|\${SKILL_NAME}|${SKILL_NAME//|/\\|}|g" \
+      -e "s|\${SKILL_TITLE}|${SKILL_TITLE//|/\\|}|g" \
+      -e "s|\${SKILL_DESCRIPTION}|${SKILL_DESCRIPTION//|/\\|}|g" \
+      -e "s|\${MISSION_DOMAIN}|${MISSION_DOMAIN//|/\\|}|g" \
+      -e "s|\${LICENSE}|${LICENSE//|/\\|}|g" \
+      -e "s|\${COMPATIBILITY}|${COMPATIBILITY//|/\\|}|g" \
+      -e "s|\${ALLOWED_TOOLS}|${ALLOWED_TOOLS//|/\\|}|g" \
+      -e "s|\${AUTOPOIETIC_VERSION}|${AUTOPOIETIC_VERSION//|/\\|}|g" \
+      -e "s|\${MISSION_HASH}|${MISSION_HASH//|/\\|}|g" \
+      -e "s|\${CREATED_AT}|${CREATED_AT//|/\\|}|g" \
+      -e "s|\${CREATED_AT_DATE}|${CREATED_AT_DATE//|/\\|}|g" \
+      "$in" \
+    | awk -v ins="$MISSION_IN_SCOPE" -v outs="$MISSION_OUT_OF_SCOPE" '
+        { gsub(/\$\{MISSION_IN_SCOPE\}/, ins); gsub(/\$\{MISSION_OUT_OF_SCOPE\}/, outs); print }
+      '
+  fi
+}
+
+# Extract a single template body from architecture.md by its marker path.
+# Marker format expected:
+#   <!-- TEMPLATE: <path> -->
+#   ```<lang>
+#   ...body...
+#   ```
+extract_template() {
+  local arch="$1" path="$2"
+  awk -v want="$path" '
+    /^<!-- TEMPLATE: / {
+      # extract path between "TEMPLATE: " and " -->"
+      line = $0
+      sub(/^<!-- TEMPLATE: /, "", line)
+      sub(/ -->$/,           "", line)
+      cur = line
+      next
+    }
+    /^```/ {
+      if (cur == want) {
+        if (in_block) { exit }
+        in_block = 1
+        next
+      } else if (in_block) {
+        # closing fence of a non-matching block: ignore
+      }
+      next
+    }
+    {
+      if (in_block && cur == want) print
+    }
+  ' "$arch"
+}
+
+# ---------- arg parsing -----------------------------------------------------
+
+NAME=""
+MISSION=""
+TARGET=""
+LICENSE_IN="Proprietary"
+ALLOWED_TOOLS_IN="Read Glob Grep"
+IN_SCOPE_FILE=""
+OUT_OF_SCOPE_FILE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mission) MISSION="$2"; shift 2 ;;
+    --target) TARGET="$2"; shift 2 ;;
+    --license) LICENSE_IN="$2"; shift 2 ;;
+    --allowed-tools) ALLOWED_TOOLS_IN="$2"; shift 2 ;;
+    --in-scope-file) IN_SCOPE_FILE="$2"; shift 2 ;;
+    --out-of-scope-file) OUT_OF_SCOPE_FILE="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '3,18p' "$0"
+      exit 0
+      ;;
+    -*)
+      die "unknown flag: $1"
+      ;;
+    *)
+      if [ -z "$NAME" ]; then NAME="$1"; shift
+      else die "unexpected positional arg: $1"
+      fi
+      ;;
+  esac
+done
+
+[ -n "$NAME" ]    || die "missing <name>"
+[ -n "$MISSION" ] || die "missing --mission \"<domain>\""
+
+# ---------- validate name per agentskills.io spec ---------------------------
+
+case "$NAME" in
+  -*|*-) die "name must not start or end with a hyphen: $NAME" ;;
+  *--*) die "name must not contain consecutive hyphens: $NAME" ;;
+esac
+case "$NAME" in
+  *[!a-z0-9-]*) die "name must be lowercase letters, digits, and hyphens only: $NAME" ;;
+esac
+[ ${#NAME} -le 64 ] || die "name must be ≤64 chars: $NAME (${#NAME})"
+[ ${#NAME} -ge 1 ]  || die "name must be non-empty"
+
+# ---------- find plugin root -----------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ARCH="$PLUGIN_ROOT/skills/autopoietic-builder/references/architecture.md"
+[ -f "$ARCH" ] || die "could not find architecture.md (looked in $ARCH)"
+
+REFS_SRC="$PLUGIN_ROOT/skills/autopoietic-builder/references"
+for r in growth-protocol.md anti-poisoning.md verification-recipes.md resume-state.md; do
+  [ -f "$REFS_SRC/$r" ] || die "missing source reference: $REFS_SRC/$r"
+done
+
+PLUGIN_VERSION="$(awk -F\" '/"version":/ { print $4; exit }' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null || echo "1.0.0")"
+
+# ---------- target dir ------------------------------------------------------
+
+if [ -z "$TARGET" ]; then
+  TARGET="${HOME}/.claude/skills"
+fi
+TARGET_SKILL="$TARGET/$NAME"
+if [ -e "$TARGET_SKILL" ]; then
+  die "target already exists: $TARGET_SKILL"
+fi
+
+# ---------- mission collection ---------------------------------------------
+
+if [ -n "$IN_SCOPE_FILE" ] && [ -f "$IN_SCOPE_FILE" ]; then
+  IN_SCOPE_RAW="$(cat "$IN_SCOPE_FILE")"
+else
+  IN_SCOPE_RAW="- (TODO: edit mission.md and add specific in-scope intent shapes)"
+fi
+
+if [ -n "$OUT_OF_SCOPE_FILE" ] && [ -f "$OUT_OF_SCOPE_FILE" ]; then
+  OUT_OF_SCOPE_RAW="$(cat "$OUT_OF_SCOPE_FILE")"
+else
+  OUT_OF_SCOPE_RAW="- (TODO: edit mission.md and explicitly name 3–5 adjacent temptations to refuse)"
+fi
+
+# ---------- placeholder values ---------------------------------------------
+
+export SKILL_NAME="$NAME"
+# title-case: replace hyphens with spaces, capitalize each word
+export SKILL_TITLE="$(printf '%s' "$NAME" | awk -F- '{
+  for (i=1; i<=NF; i++) { $i = toupper(substr($i,1,1)) substr($i,2) }
+  for (i=1; i<=NF; i++) { printf "%s%s", (i==1?"":" "), $i }
+}')"
+export SKILL_DESCRIPTION="Use when working within the scope defined in mission.md. $MISSION"
+export MISSION_DOMAIN="$MISSION"
+export MISSION_IN_SCOPE="$IN_SCOPE_RAW"
+export MISSION_OUT_OF_SCOPE="$OUT_OF_SCOPE_RAW"
+export LICENSE="$LICENSE_IN"
+export COMPATIBILITY="Designed for Claude Code; runs in any harness honoring AGENTS.md and the agentskills.io spec."
+export ALLOWED_TOOLS="$ALLOWED_TOOLS_IN"
+export AUTOPOIETIC_VERSION="$PLUGIN_VERSION"
+export CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export CREATED_AT_DATE="$(date -u +%Y-%m-%d)"
+export MISSION_HASH="pending"  # patched after mission.md is rendered
+
+# ---------- write template files -------------------------------------------
+
+note "scaffolding $TARGET_SKILL"
+mkdir -p "$TARGET_SKILL"
+mkdir -p "$TARGET_SKILL/references"
+mkdir -p "$TARGET_SKILL/capabilities"
+mkdir -p "$TARGET_SKILL/cache"
+mkdir -p "$TARGET_SKILL/learned"
+mkdir -p "$TARGET_SKILL/tests/baseline"
+mkdir -p "$TARGET_SKILL/tests/growth"
+mkdir -p "$TARGET_SKILL/.state"
+
+# Each template path defined in architecture.md.
+TEMPLATES="
+SKILL.md
+AGENTS.md
+mission.md
+.gitignore
+capabilities/INDEX.md
+cache/INDEX.md
+learned/README.md
+tests/baseline/README.md
+tests/growth/README.md
+.state/.gitkeep
+"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+for tpl in $TEMPLATES; do
+  raw="$TMP_DIR/$(printf '%s' "$tpl" | tr '/' '_')"
+  extract_template "$ARCH" "$tpl" > "$raw"
+  if [ ! -s "$raw" ]; then
+    die "template not found in architecture.md: $tpl"
+  fi
+  out="$TARGET_SKILL/$tpl"
+  mkdir -p "$(dirname "$out")"
+  render_with_allowlist "$raw" > "$out"
+done
+
+# ---------- compute mission_hash and patch SKILL.md ------------------------
+
+MISSION_FILE="$TARGET_SKILL/mission.md"
+[ -f "$MISSION_FILE" ] || die "rendering produced no mission.md"
+COMPUTED_HASH="$(sha256_of_file "$MISSION_FILE")"
+SKILL_FILE="$TARGET_SKILL/SKILL.md"
+# replace the placeholder mission_hash in SKILL.md
+if grep -q 'mission_hash: "pending"' "$SKILL_FILE"; then
+  # portable in-place edit (BSD sed needs '' arg, GNU does not)
+  if sed --version >/dev/null 2>&1; then
+    sed -i "s|mission_hash: \"pending\"|mission_hash: \"$COMPUTED_HASH\"|" "$SKILL_FILE"
+  else
+    sed -i '' "s|mission_hash: \"pending\"|mission_hash: \"$COMPUTED_HASH\"|" "$SKILL_FILE"
+  fi
+fi
+
+# ---------- copy reference files (no substitution) -------------------------
+
+for r in growth-protocol.md anti-poisoning.md verification-recipes.md resume-state.md; do
+  cp "$REFS_SRC/$r" "$TARGET_SKILL/references/$r"
+done
+
+# ---------- self-containment audit ----------------------------------------
+
+if grep -r 'autopoietic-builder:' "$TARGET_SKILL" >/dev/null 2>&1; then
+  die "self-containment audit FAILED: generated skill references the meta-skill at runtime"
+fi
+
+# ---------- optional spec validation --------------------------------------
+
+if command -v skills-ref >/dev/null 2>&1; then
+  note "running skills-ref validate ..."
+  skills-ref validate "$TARGET_SKILL" || die "skills-ref validate failed"
+else
+  note "skills-ref not installed; skipping validate step"
+  note "  install: https://github.com/agentskills/agentskills/tree/main/skills-ref"
+fi
+
+# ---------- summary --------------------------------------------------------
+
+cat <<EOF
+
+scaffolded $NAME at $TARGET_SKILL
+
+  mission_hash: $COMPUTED_HASH
+  autopoietic_version: $AUTOPOIETIC_VERSION
+  created_at: $CREATED_AT
+
+next steps:
+  1. edit $MISSION_FILE — fill in the in-scope and out-of-scope bullets
+  2. recompute mission_hash and update $SKILL_FILE if you edit mission.md outside this scaffolder
+  3. drop the new skill into your harness:
+       Claude Code:  ln -s "$TARGET_SKILL" ~/.claude/skills/  (if not already there)
+       any AGENTS.md harness:  open $TARGET_SKILL/AGENTS.md
+  4. validate again whenever you edit:  skills-ref validate $TARGET_SKILL
+
+EOF
