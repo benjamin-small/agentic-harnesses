@@ -1,6 +1,14 @@
 # agentic-harnesses
 
-A workshop repo. Each subdirectory is one self-contained idea — its own plugin root, its own README, its own tests.
+Agentic Harnesses is a workshop for experimental agent tools. Each subdirectory is one self-contained idea—its own plugin root, README, and tests—so an experiment can be installed and evaluated independently.
+
+The repository currently contains `autopoietic-builder`, a portable shell scaffolder and skill bundle for creating mission-bounded agents that can retain verified knowledge.
+
+## Requirements
+
+- Requires Bash 3.2 or newer
+- Standard Unix tools: `awk`, `sed`, `grep`, `cp`, and either `sha256sum` or `shasum`
+- Optional: `envsubst` and `skills-ref`
 
 ## Conventions
 
@@ -27,3 +35,13 @@ agentic-harnesses/
 ```
 
 Add a row to the table above.
+
+## Validation
+
+Run the deterministic scaffolder tests from the repository root:
+
+```sh
+bash tests/scaffold-autopoietic-skill.test.sh
+```
+
+See [docs/testing.md](docs/testing.md) for the measured coverage and test scope, and [docs/configuration.md](docs/configuration.md) for supported arguments and environment behavior.
